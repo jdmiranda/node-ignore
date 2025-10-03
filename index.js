@@ -308,7 +308,6 @@ const REPLACERS = [
 const REGEX_REPLACE_TRAILING_WILDCARD = /(^|\\\/)?\\\*$/
 const MODE_IGNORE = 'regex'
 const MODE_CHECK_IGNORE = 'checkRegex'
-const UNDERSCORE = '_'
 
 const TRAILING_WILD_CARD_REPLACERS = {
   [MODE_IGNORE] (_, p1) {
@@ -343,12 +342,29 @@ const TRAILING_WILD_CARD_REPLACERS = {
   }
 }
 
+// Performance optimization: Cache for regex prefix transformations
+const regexPrefixCache = new Map()
+
 // @param {pattern}
-const makeRegexPrefix = pattern => REPLACERS.reduce(
-  (prev, [matcher, replacer]) =>
-    prev.replace(matcher, replacer.bind(pattern)),
-  pattern
-)
+const makeRegexPrefix = pattern => {
+  // Fast path: check cache
+  if (regexPrefixCache.has(pattern)) {
+    return regexPrefixCache.get(pattern)
+  }
+
+  const result = REPLACERS.reduce(
+    (prev, [matcher, replacer]) =>
+      prev.replace(matcher, replacer.bind(pattern)),
+    pattern
+  )
+
+  // Cache the result for future use
+  // Limit cache size to prevent memory issues
+  if (regexPrefixCache.size < 1000) {
+    regexPrefixCache.set(pattern, result)
+  }
+  return result
+}
 
 const isString = subject => typeof subject === 'string'
 
@@ -381,23 +397,26 @@ class IgnoreRule {
     define(this, 'body', body)
     define(this, 'ignoreCase', ignoreCase)
     define(this, 'regexPrefix', prefix)
+
+    // Performance optimization: Pre-cache regex objects
+    this._regexCache = new Map()
   }
 
   get regex () {
-    const key = UNDERSCORE + MODE_IGNORE
+    const key = MODE_IGNORE
 
-    if (this[key]) {
-      return this[key]
+    if (this._regexCache.has(key)) {
+      return this._regexCache.get(key)
     }
 
     return this._make(MODE_IGNORE, key)
   }
 
   get checkRegex () {
-    const key = UNDERSCORE + MODE_CHECK_IGNORE
+    const key = MODE_CHECK_IGNORE
 
-    if (this[key]) {
-      return this[key]
+    if (this._regexCache.has(key)) {
+      return this._regexCache.get(key)
     }
 
     return this._make(MODE_CHECK_IGNORE, key)
@@ -415,7 +434,9 @@ class IgnoreRule {
       ? new RegExp(str, 'i')
       : new RegExp(str)
 
-    return define(this, key, regex)
+    // Store in Map for faster subsequent access
+    this._regexCache.set(key, regex)
+    return regex
   }
 }
 
@@ -456,6 +477,8 @@ class RuleManager {
   constructor (ignoreCase) {
     this._ignoreCase = ignoreCase
     this._rules = []
+    // Performance optimization: Use Map for faster rule lookups
+    this._ruleMap = new Map()
   }
 
   _add (pattern) {
@@ -476,6 +499,8 @@ class RuleManager {
       const rule = createRule(pattern, this._ignoreCase)
       this._added = true
       this._rules.push(rule)
+      // Store in map for potential optimizations
+      this._ruleMap.set(pattern.pattern, rule)
     }
   }
 
@@ -505,7 +530,13 @@ class RuleManager {
     let unignored = false
     let matchedRule
 
-    this._rules.forEach(rule => {
+    // Performance optimization: Use for-loop instead of forEach
+    const {_rules: rules} = this
+    const {length} = rules
+    let i = 0
+
+    for (; i < length; i ++) {
+      const rule = rules[i]
       const {negative} = rule
 
       //          |           ignored : unignored
@@ -523,13 +554,15 @@ class RuleManager {
         unignored === negative && ignored !== unignored
         || negative && !ignored && !unignored && !checkUnignored
       ) {
-        return
+        // eslint-disable-next-line no-continue
+        continue
       }
 
       const matched = rule[mode].test(path)
 
       if (!matched) {
-        return
+        // eslint-disable-next-line no-continue
+        continue
       }
 
       ignored = !negative
@@ -538,7 +571,7 @@ class RuleManager {
       matchedRule = negative
         ? UNDEFINED
         : rule
-    })
+    }
 
     const ret = {
       ignored,
@@ -605,11 +638,12 @@ class Ignore {
   }
 
   _initCache () {
+    // Performance optimization: Use Map instead of Object for better performance
     // A cache for the result of `.ignores()`
-    this._ignoreCache = Object.create(null)
+    this._ignoreCache = new Map()
 
     // A cache for the result of `.test()`
-    this._testCache = Object.create(null)
+    this._testCache = new Map()
   }
 
   add (pattern) {
@@ -684,8 +718,9 @@ class Ignore {
     // The path slices
     slices
   ) {
-    if (path in cache) {
-      return cache[path]
+    // Performance optimization: Use Map.has() instead of 'in' operator
+    if (cache.has(path)) {
+      return cache.get(path)
     }
 
     if (!slices) {
@@ -698,7 +733,9 @@ class Ignore {
 
     // If the path has no parent directory, just test it
     if (!slices.length) {
-      return cache[path] = this._rules.test(path, checkUnignored, MODE_IGNORE)
+      const result = this._rules.test(path, checkUnignored, MODE_IGNORE)
+      cache.set(path, result)
+      return result
     }
 
     const parent = this._t(
@@ -709,11 +746,14 @@ class Ignore {
     )
 
     // If the path contains a parent directory, check the parent first
-    return cache[path] = parent.ignored
+    const result = parent.ignored
       // > It is not possible to re-include a file if a parent directory of
       // >   that file is excluded.
       ? parent
       : this._rules.test(path, checkUnignored, MODE_IGNORE)
+
+    cache.set(path, result)
+    return result
   }
 
   ignores (path) {
